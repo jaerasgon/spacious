@@ -213,7 +213,8 @@ impl Tree {
         }
     }
 
-    /// Rebuild the arena without unused slots. Node indices change: callers re-find by path.
+    /// Rebuild the arena without unused slots, each folder's children sorted largest first.
+    /// Node indices change: callers re-find by path.
     pub fn compact(&mut self) {
         let mut old = std::mem::take(&mut self.nodes);
         let mut out: Vec<Node> = Vec::with_capacity(old.len().saturating_sub(self.garbage));
@@ -224,8 +225,10 @@ impl Tree {
         while let Some(ni) = queue.pop_front() {
             let (f, n) = (out[ni as usize].first_child, out[ni as usize].n_children);
             let first = out.len() as u32;
-            for c in f..f.wrapping_add(n) {
-                let mut node = std::mem::replace(&mut old[c as usize], Node::dead());
+            let mut kids: Vec<Node> =
+                (f..f.wrapping_add(n)).map(|c| std::mem::replace(&mut old[c as usize], Node::dead())).collect();
+            kids.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+            for mut node in kids {
                 node.parent = ni;
                 if node.n_children == 0 {
                     node.first_child = NONE;

@@ -54,17 +54,19 @@ fn layout_children(tree: &Tree, dir: u32, rect: Rect, expanded: &HashSet<u32>, o
         return;
     }
     let scale = rect.area() as f64 / total as f64;
+    // Children are sorted, except while a scan or live update is still filling sizes in.
+    let mut kids: Vec<u32> = tree.children(dir).filter(|&c| tree.node(c).size > 0).collect();
+    if !kids.windows(2).all(|w| tree.node(w[0]).size >= tree.node(w[1]).size) {
+        kids.sort_unstable_by(|&a, &b| tree.node(b).size.cmp(&tree.node(a).size));
+    }
     let mut items: Vec<Item> = Vec::new();
     let mut values: Vec<f64> = Vec::new();
     let mut shown: u64 = 0;
     let mut rest_count = 0u32;
-    for c in tree.children(dir) {
+    for (k, &c) in kids.iter().enumerate() {
         let s = tree.node(c).size;
-        if s == 0 {
-            break; // sorted: the rest are empty too
-        }
         if (s as f64 * scale) < MIN_AREA as f64 {
-            rest_count = tree.children(dir).end - c;
+            rest_count = (kids.len() - k) as u32;
             break;
         }
         items.push(Item::Node(c));

@@ -13,7 +13,8 @@ use egui::{
 };
 
 use crate::live::{Live, Patch, apply_patches};
-use crate::scan::{self, NONE, ScanJob, Tree};
+use crate::scan::{NONE, Tree};
+use crate::stream::{self, Builder, ScanJob};
 use crate::theme::*;
 use crate::treemap::{self, Cell, HEADER_H, Item};
 use crate::util::{Cat, expand, fmt_count, fmt_duration, fmt_size, fmt_time, home_dir, tilde};
@@ -87,6 +88,10 @@ pub struct App {
     tree: Option<Arc<Tree>>,
     generation: u64,
     job: Option<ScanJob>,
+    /// Fills the tree from the running scan's messages.
+    builder: Option<Builder>,
+    /// Bumped whenever the running scan adds to the tree, so views redraw.
+    scan_rev: u64,
     /// Path to open once the running scan finishes (rescan keeps your place).
     goto_after_scan: Option<String>,
     root: u32,
@@ -126,10 +131,12 @@ impl App {
         install(&cc.egui_ctx, load_theme());
         let recent = load_recent();
         let mut app = App {
-            path_input: initial.clone().unwrap_or_else(|| tilde(&home_dir())),
+            path_input: tilde(initial.as_deref().unwrap_or("/")),
             tree: None,
             generation: 0,
             job: None,
+            builder: None,
+            scan_rev: 0,
             goto_after_scan: None,
             root: 0,
             selected: None,
@@ -155,9 +162,9 @@ impl App {
             live: None,
             pending: Vec::new(),
         };
-        if let Some(p) = initial {
-            app.start_scan(&cc.egui_ctx, expand(&p));
-        }
+        // Scan the whole drive unless a folder was given.
+        let start = initial.unwrap_or_else(|| "/".into());
+        app.start_scan(&cc.egui_ctx, expand(&start));
         app
     }
 
@@ -182,8 +189,24 @@ impl App {
         self.recent.insert(0, path.clone());
         self.recent.truncate(10);
         save_recent(&self.recent);
+
+        // Show the map straight away and let the scan fill it in.
+        let old = self.tree.replace(Arc::new(stream::new_tree(&path)));
+        if let Some(old) = old {
+            // Freeing millions of names takes a moment: do it off the UI thread.
+            std::thread::spawn(move || drop(old));
+        }
+        self.builder = Some(Builder::new());
+        self.generation += 1;
+        self.root = 0;
+        self.selected = None;
+        self.props = None;
+        self.menu_target = None;
+        self.expanded.clear();
+        self.expanded_gen += 1;
+        self.search_result = None;
         let c = ctx.clone();
-        self.job = Some(scan::start(path, move || c.request_repaint()));
+        self.job = Some(stream::start(path, move || c.request_repaint()));
     }
 
     fn rescan(&mut self, ctx: &egui::Context) {
@@ -197,46 +220,63 @@ impl App {
 
     fn poll_scan(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
-        match job.poll() {
-            None => ctx.request_repaint_after(Duration::from_millis(100)),
-            Some(result) => {
-                let job = self.job.take().unwrap();
-                match result {
-                    Some(tree) => {
-                        let old = self.tree.replace(Arc::new(tree));
-                        // Freeing millions of names takes a moment: do it off the UI thread.
-                        if let Some(old) = old {
-                            std::thread::spawn(move || drop(old));
-                        }
-                        self.generation += 1;
-                        self.root = 0;
-                        self.selected = None;
-                        self.props = None;
-                        self.expanded.clear();
-                        self.expanded_gen += 1;
-                        self.search_result = None;
-                        if let (Some(p), Some(t)) = (self.goto_after_scan.take(), &self.tree)
-                            && let Some(i) = t.find(&p)
-                            && t.node(i).is_dir
-                        {
-                            self.root = i;
-                        }
-                        if let Some(t) = &self.tree {
-                            let c = ctx.clone();
-                            self.live = Live::start(t.root_path.clone(), move || c.request_repaint());
-                        }
-                    }
-                    None => {
-                        if !job.progress.cancel.load(Ordering::Relaxed) {
-                            self.toast_err(format!(
-                                "Can't read {}. macOS may be blocking it: give Spacious Full Disk Access, then scan again.",
-                                tilde(&job.root)
-                            ));
-                        }
-                        self.goto_after_scan = None;
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let (Some(arc), Some(builder)) = (self.tree.as_mut(), self.builder.as_mut()) else { return };
+        // A search thread may hold the tree for a moment: apply next frame.
+        let Some(tree) = Arc::get_mut(arc) else { return };
+        let done = job.done();
+        // Apply what has arrived, within a few milliseconds so the window stays smooth.
+        let budget = Instant::now() + Duration::from_millis(8);
+        let mut applied = 0u32;
+        let mut drained = false;
+        loop {
+            match job.try_recv() {
+                Some(m) => {
+                    builder.apply(tree, m);
+                    applied += 1;
+                    if applied % 256 == 0 && Instant::now() > budget {
+                        break;
                     }
                 }
+                None => {
+                    drained = true;
+                    break;
+                }
             }
+        }
+        if applied > 0 {
+            self.scan_rev += 1;
+        }
+        if !(done && drained) {
+            return;
+        }
+
+        // The scan has ended: sort, compact, and keep the user's place.
+        let Some(mut arc) = self.tree.take() else { return };
+        let Some(tree) = Arc::get_mut(&mut arc) else {
+            self.tree = Some(arc);
+            return;
+        };
+        let job = self.job.take().unwrap();
+        self.builder = None;
+        let places = remember(self, tree);
+        stream::finish(tree, job.started.elapsed());
+        let goto = self.goto_after_scan.take();
+        restore(self, tree, places);
+        if let Some(p) = goto
+            && let Some(i) = tree.find(&p)
+            && tree.node(i).is_dir
+        {
+            self.root = i;
+        }
+        let root_path = tree.root_path.clone();
+        self.tree = Some(arc);
+        self.generation += 1;
+        if job.cancelled() {
+            self.toast("Scan stopped. The map shows what was read so far.");
+        } else {
+            let c = ctx.clone();
+            self.live = Live::start(root_path, move || c.request_repaint());
         }
     }
 
@@ -249,31 +289,23 @@ impl App {
         if self.pending.is_empty() || self.job.is_some() {
             return;
         }
-        let Some(arc) = self.tree.as_mut() else {
+        let Some(mut arc) = self.tree.take() else {
             self.pending.clear();
             return;
         };
         // A search thread may still hold the tree: try again shortly.
-        let Some(tree) = Arc::get_mut(arc) else {
+        let Some(tree) = Arc::get_mut(&mut arc) else {
+            self.tree = Some(arc);
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
         };
 
-        // Indices move during edits: remember places by path.
-        let root_p = tree.path(self.root);
-        let sel_p = self.selected.map(|s| tree.path(s));
-        let props_p = self.props.as_ref().map(|p| tree.path(p.node));
-        let open_p: Vec<String> = self.expanded.iter().map(|&e| tree.path(e)).collect();
-
+        // Indices move during edits: remember places by path, including what an open
+        // right-click menu points at, so the menu stays as it is.
+        let places = remember(self, tree);
         let requests = apply_patches(tree, std::mem::take(&mut self.pending));
-
-        let root = tree.nearest(&root_p);
-        self.root = if tree.node(root).is_dir { root } else { tree.node(root).parent };
-        self.selected = sel_p.and_then(|p| tree.find(&p));
-        self.props = props_p.and_then(|p| tree.find(&p)).map(|n| Props { node: n, top: tree.top_files(n, 5) });
-        self.expanded = open_p.iter().filter_map(|p| tree.find(p)).collect();
-        self.expanded_gen += 1;
-        self.menu_target = None;
+        restore(self, tree, places);
+        self.tree = Some(arc);
         self.generation += 1;
         if let Some(l) = &self.live {
             for r in requests {
@@ -866,7 +898,7 @@ impl App {
 
         let q = self.search.trim().to_lowercase();
         let key = (
-            self.generation,
+            self.generation.wrapping_mul(1_000_003).wrapping_add(self.scan_rev),
             self.root,
             [area.min.x as i32, area.min.y as i32, area.max.x as i32, area.max.y as i32],
             q.clone(),
@@ -1001,7 +1033,7 @@ impl App {
                 _ => (Vec::new(), None),
             };
         }
-        let key = (self.generation, self.root, self.sort.0, self.sort.1);
+        let key = (self.generation.wrapping_mul(1_000_003).wrapping_add(self.scan_rev), self.root, self.sort.0, self.sort.1);
         if self.list_key != Some(key) {
             let mut v: Vec<u32> = tree.children(self.root).collect();
             sort_nodes(tree, &mut v, self.sort);
@@ -1102,7 +1134,7 @@ impl App {
                     let i = rows[k];
                     let n = tree.node(i);
                     let (r, _) = ui.allocate_exact_size(vec2(w, ROW_H), Sense::hover());
-                    let resp = ui.interact(r, Id::new(("list.row", i)), Sense::click());
+                    let resp = ui.interact(r, Id::new(("list.row", tree.path(i))), Sense::click());
                     let selected = self.selected == Some(i);
                     let bg = if selected {
                         tk().row_selected
@@ -1302,8 +1334,8 @@ impl eframe::App for App {
             let full = ui.max_rect();
             ui.painter().rect_filled(full, CornerRadius::ZERO, tk().app_bg);
             let rect = Rect::from_min_max(pos2(full.min.x, full.min.y + GAP), full.max);
-            match (self.job.is_some(), self.tree.clone()) {
-                (false, Some(tree)) => match self.view {
+            match (true, self.tree.clone()) {
+                (true, Some(tree)) => match self.view {
                     View::Treemap => self.treemap_view(ui, &tree, rect),
                     View::List => self.list_view(ui, &tree, rect),
                 },
@@ -1312,6 +1344,47 @@ impl eframe::App for App {
         });
         self.properties(&ctx);
     }
+}
+
+// ── Keeping places across tree edits ───────────────────────────────────────
+
+/// Where the user is, by path, so it survives edits that move node indices.
+struct Places {
+    root: String,
+    selected: Option<String>,
+    props: Option<String>,
+    open: Vec<String>,
+    /// What an open right-click menu points at; small-item boxes keep their counts.
+    menu: Option<(String, Option<(u32, u64)>)>,
+}
+
+fn remember(app: &App, tree: &Tree) -> Places {
+    Places {
+        root: tree.path(app.root),
+        selected: app.selected.map(|s| tree.path(s)),
+        props: app.props.as_ref().map(|p| tree.path(p.node)),
+        open: app.expanded.iter().map(|&e| tree.path(e)).collect(),
+        menu: app.menu_target.map(|m| match m {
+            Item::Node(i) => (tree.path(i), None),
+            Item::Rest { parent, count, size } => (tree.path(parent), Some((count, size))),
+        }),
+    }
+}
+
+fn restore(app: &mut App, tree: &Tree, p: Places) {
+    let root = tree.nearest(&p.root);
+    app.root = if tree.node(root).is_dir { root } else { tree.node(root).parent };
+    app.selected = p.selected.and_then(|s| tree.find(&s));
+    app.props = p.props.and_then(|s| tree.find(&s)).map(|n| Props { node: n, top: tree.top_files(n, 5) });
+    app.expanded = p.open.iter().filter_map(|s| tree.find(s)).collect();
+    app.expanded_gen += 1;
+    app.menu_target = p.menu.and_then(|(path, rest)| {
+        let i = tree.find(&path)?;
+        Some(match rest {
+            None => Item::Node(i),
+            Some((count, size)) => Item::Rest { parent: i, count, size },
+        })
+    });
 }
 
 // ── Drawing helpers ─────────────────────────────────────────────────────────

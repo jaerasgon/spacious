@@ -10,14 +10,16 @@
   <a href="https://ko-fi.com/jaerasgon"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support me on Ko-fi" height="28" align="center"></a>
 </p>
 
-Spacious scans a folder (or your whole disk) and draws it as a map of rectangles: the
+Spacious scans your whole disk (or any folder) and draws it as a map of rectangles: the
 bigger the rectangle, the more space it takes. Click a folder to open it in place, and
 keep clicking until you find what's filling your drive. It's in the spirit of SpaceSniffer,
 made for the Mac.
 
 ## What it does
 
-- **Scans fast.** Folders are read in parallel: about 1.6 million files in under 8 seconds
+- **Starts right away.** Spacious scans your whole drive when it opens, and the map fills
+  in while it scans: you can explore before it's done.
+- **Scans fast.** Folders are read in parallel: about 2.8 million files in under 14 seconds
   on an M-series Mac, with no limit on how many files a folder holds.
 - **Counts what's really used.** Sizes are space on disk, so sparse files (like Docker
   images) don't look bigger than they are, and hard-linked files count once.

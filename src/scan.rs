@@ -9,7 +9,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -164,10 +164,9 @@ impl Tree {
                 continue;
             }
             for c in self.children(n) {
-                // Children are sorted, so a folder smaller than the current k-th file can't help.
-                let cn = self.node(c);
-                if top.len() == k && cn.size <= self.node(top[k - 1]).size {
-                    break;
+                // A folder smaller than the current k-th file can't help.
+                if top.len() == k && self.node(c).size <= self.node(top[k - 1]).size {
+                    continue;
                 }
                 stack.push(c);
             }
@@ -185,45 +184,6 @@ pub struct Progress {
     pub unreadable: AtomicU64,
     pub current: Mutex<String>,
     pub cancel: AtomicBool,
-}
-
-pub struct ScanJob {
-    pub root: String,
-    pub progress: Arc<Progress>,
-    pub started: Instant,
-    rx: mpsc::Receiver<Option<Tree>>,
-}
-
-impl ScanJob {
-    /// `Some(Some(tree))` when done, `Some(None)` when cancelled or failed, `None` while running.
-    pub fn poll(&self) -> Option<Option<Tree>> {
-        match self.rx.try_recv() {
-            Ok(t) => Some(t),
-            Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => Some(None),
-        }
-    }
-
-    pub fn cancel(&self) {
-        self.progress.cancel.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Start scanning `root` on background threads. `wake` is called when the scan finishes.
-pub fn start(root: String, wake: impl Fn() + Send + 'static) -> ScanJob {
-    let progress = Arc::new(Progress::default());
-    let (tx, rx) = mpsc::channel();
-    let p = progress.clone();
-    let r = root.clone();
-    std::thread::Builder::new()
-        .name("spacious-scan".into())
-        .spawn(move || {
-            let tree = scan_blocking(&r, &p);
-            let _ = tx.send(tree);
-            wake();
-        })
-        .expect("spawn scan thread");
-    ScanJob { root, progress, started: Instant::now(), rx }
 }
 
 struct Ctx<'a> {
