@@ -39,7 +39,11 @@ made for the Mac.
 Get the latest **Spacious-…-macos-universal.zip** from
 [Releases](https://github.com/jaerasgon/spacious/releases/latest), unzip it, and drag
 **Spacious** to Applications. It runs on Apple silicon and Intel Macs with macOS 11 or
-later, and it's signed and notarized by Apple.
+later.
+
+**First launch:** Spacious is signed but not yet notarized by Apple, so macOS asks before
+opening it the first time. Open it once, then go to System Settings ▸ Privacy & Security,
+scroll down and click **Open Anyway** next to Spacious. After that it opens normally.
 
 To see folders macOS protects (Mail, Messages, Safari and others), give Spacious **Full
 Disk Access** in System Settings ▸ Privacy & Security. Spacious tells you when some folders
